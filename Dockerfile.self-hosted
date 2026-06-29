@@ -1,0 +1,21 @@
+FROM golang:1.23-alpine AS builder
+
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# Build frontend placeholder so embed.go doesn't fail
+RUN mkdir -p internal/dashboardui/dist && \
+    echo '<!DOCTYPE html><html><body>MCPJungle</body></html>' > internal/dashboardui/dist/index.html
+
+RUN CGO_ENABLED=0 GOOS=linux go build -o mcpjungle ./cmd/mcpjungle
+
+FROM gcr.io/distroless/static-debian12
+
+COPY --from=builder /app/mcpjungle /mcpjungle
+
+EXPOSE 8080
+ENTRYPOINT ["/mcpjungle"]
+CMD ["start"]
