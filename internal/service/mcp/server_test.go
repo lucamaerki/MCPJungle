@@ -31,6 +31,7 @@ func setupTestDBForServerLifecycle(t *testing.T) *gorm.DB {
 		&model.Resource{},
 		&model.UpstreamOAuthToken{},
 		&model.UpstreamOAuthPendingSession{},
+		&model.UserUpstreamOAuthPendingSession{},
 	)
 	require.NoError(t, err)
 

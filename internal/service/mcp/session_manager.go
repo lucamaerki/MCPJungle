@@ -70,7 +70,7 @@ func NewSessionManager(cfg *SessionManagerConfig) *SessionManager {
 		initReqTimeoutSec: cfg.InitReqTimeoutSec,
 		cleanupStopChan:   make(chan struct{}),
 		createSessionFunc: func(ctx context.Context, s *model.McpServer, initReqTimeoutSec int) (*client.Client, error) {
-			return createMcpServerConnectionWithDB(ctx, cfg.DB, s, initReqTimeoutSec, true)
+			return createMcpServerConnectionWithDB(ctx, cfg.DB, s, initReqTimeoutSec, true, nil)
 		},
 	}
 
@@ -238,12 +238,13 @@ func createMcpServerConnectionWithDB(
 	s *model.McpServer,
 	initReqTimeoutSec int,
 	useStoredUpstreamAuth bool,
+	userID *uint,
 ) (*client.Client, error) {
 	switch s.Transport {
 	case types.TransportStreamableHTTP:
-		return createHTTPMcpServerConn(ctx, db, s, initReqTimeoutSec, useStoredUpstreamAuth)
+		return createHTTPMcpServerConn(ctx, db, s, initReqTimeoutSec, useStoredUpstreamAuth, userID)
 	case types.TransportSSE:
-		return createSSEMcpServerConn(ctx, db, s, useStoredUpstreamAuth)
+		return createSSEMcpServerConn(ctx, db, s, useStoredUpstreamAuth, userID)
 	case types.TransportStdio:
 		return runStdioServer(ctx, s, initReqTimeoutSec)
 	default:

@@ -135,5 +135,9 @@ func (u *UserService) DeleteUser(username string) error {
 	if err != nil {
 		return fmt.Errorf("failed to delete user: %w", err)
 	}
+
+	// Clean up all per-user OAuth tokens associated with this user.
+	u.db.Unscoped().Where("user_id = ?", user.ID).Delete(&model.UpstreamOAuthToken{})
+
 	return nil
 }

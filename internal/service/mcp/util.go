@@ -215,6 +215,23 @@ func convertResourceModelToMcpObject(r *model.Resource) (mcp.Resource, error) {
 	return mcpResource, nil
 }
 
+// resolveUpstreamOAuthToken returns the best available OAuth token for a server call.
+// If userID is set and a user-scoped token exists, it is returned with the userID.
+// If not, the shared gateway token is returned with nil userID as fallback.
+// Returns (nil, nil) when no token is available.
+func resolveUpstreamOAuthToken(db *gorm.DB, serverName string, userID *uint) (*model.UpstreamOAuthToken, *uint) {
+	if userID != nil {
+		if tokenModel, err := getStoredUserUpstreamOAuthToken(db, serverName, *userID); err == nil {
+			return tokenModel, userID
+		}
+		log.Printf("[INFO] no user-scoped OAuth token found for server %s (user %d), falling back to gateway token", serverName, *userID)
+	}
+	if tokenModel, err := getStoredUpstreamOAuthToken(db, serverName); err == nil {
+		return tokenModel, nil
+	}
+	return nil, nil
+}
+
 // prepareSHTTPClientOptions prepares the options (specifically, http headers) for creating a
 // streamable HTTP client based on the MCP server's configuration.
 // If a bearer token is provided in the config and a custom Authorization header is set, the custom header
@@ -266,13 +283,15 @@ func initializeHTTPClient(ctx context.Context, c *client.Client, url string, ini
 
 // createHTTPMcpServerConn creates and initializes a streamable HTTP client for
 // an upstream MCP server. When useStoredUpstreamAuth is true, it attempts to
-// attach any stored upstream OAuth credentials loaded from the DB.
+// attach stored upstream OAuth credentials. If userID is set, the user-scoped
+// token is preferred; otherwise the shared gateway token is used as fallback.
 func createHTTPMcpServerConn(
 	ctx context.Context,
 	db *gorm.DB,
 	s *model.McpServer,
 	initReqTimeoutSec int,
 	useStoredUpstreamAuth bool,
+	userID *uint,
 ) (*client.Client, error) {
 	conf, err := s.GetStreamableHTTPConfig()
 	if err != nil {
@@ -284,8 +303,8 @@ func createHTTPMcpServerConn(
 	var c *client.Client
 
 	if useStoredUpstreamAuth && db != nil {
-		tokenModel, err := getStoredUpstreamOAuthToken(db, s.Name)
-		if err == nil {
+		tokenModel, tokenUserID := resolveUpstreamOAuthToken(db, s.Name, userID)
+		if tokenModel != nil {
 			hasStoredOAuthTokens := tokenModel.AccessToken != "" || tokenModel.RefreshToken != ""
 			if hasStoredOAuthTokens {
 				scopes, err := scopesFromJSON(tokenModel.Scopes)
@@ -301,6 +320,7 @@ func createHTTPMcpServerConn(
 						db:         db,
 						serverName: s.Name,
 						transport:  s.Transport,
+						userID:     tokenUserID,
 					},
 					PKCEEnabled: true,
 				}
@@ -309,8 +329,6 @@ func createHTTPMcpServerConn(
 					return nil, fmt.Errorf("failed to create OAuth streamable HTTP client for MCP server: %w", err)
 				}
 			}
-		} else if !errors.Is(err, apierrors.ErrNotFound) {
-			return nil, fmt.Errorf("failed to load stored OAuth token for server %s: %w", s.Name, err)
 		}
 	}
 
@@ -434,13 +452,15 @@ func defaultSSEInitializeRequest() mcp.InitializeRequest {
 }
 
 // createSSEMcpServerConn creates and initializes an SSE client for an upstream
-// MCP server. When useStoredUpstreamAuth is true, it attempts to attach any
-// stored upstream OAuth credentials loaded from the DB.
+// MCP server. When useStoredUpstreamAuth is true, it attempts to attach stored
+// upstream OAuth credentials. If userID is set, the user-scoped token is
+// preferred; otherwise the shared gateway token is used as fallback.
 func createSSEMcpServerConn(
 	ctx context.Context,
 	db *gorm.DB,
 	s *model.McpServer,
 	useStoredUpstreamAuth bool,
+	userID *uint,
 ) (*client.Client, error) {
 	conf, err := s.GetSSEConfig()
 	if err != nil {
@@ -460,7 +480,8 @@ func createSSEMcpServerConn(
 	}
 
 	if useStoredUpstreamAuth && db != nil {
-		if tokenModel, err := getStoredUpstreamOAuthToken(db, s.Name); err == nil {
+		tokenModel, tokenUserID := resolveUpstreamOAuthToken(db, s.Name, userID)
+		if tokenModel != nil {
 			hasStoredOAuthTokens := tokenModel.AccessToken != "" || tokenModel.RefreshToken != ""
 			if hasStoredOAuthTokens {
 				scopes, err := scopesFromJSON(tokenModel.Scopes)
@@ -476,6 +497,7 @@ func createSSEMcpServerConn(
 						db:         db,
 						serverName: s.Name,
 						transport:  s.Transport,
+						userID:     tokenUserID,
 					},
 					PKCEEnabled: true,
 				}
@@ -484,8 +506,6 @@ func createSSEMcpServerConn(
 					return nil, fmt.Errorf("failed to create OAuth SSE client for MCP server: %w", err)
 				}
 			}
-		} else if !errors.Is(err, apierrors.ErrNotFound) {
-			return nil, fmt.Errorf("failed to load stored OAuth token for server %s: %w", s.Name, err)
 		}
 	}
 	if c == nil {

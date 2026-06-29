@@ -66,29 +66,38 @@ func (sr *sessionResult) invalidateOnError(err error) {
 // getSession returns a session for the given MCP server.
 // For stateful servers, it returns a persistent session from the SessionManager.
 // For stateless servers, it creates a new session that should be closed after use.
+// If a User is present in the context, their user-scoped OAuth token is preferred
+// over the shared gateway token for stateless connections.
 func (m *MCPService) getSession(ctx context.Context, server *model.McpServer) (*sessionResult, error) {
 	if server.SessionMode == types.SessionModeStateful {
-		// Use the session manager for stateful sessions
+		// Stateful sessions use the shared gateway token (known limitation: no per-user OAuth).
 		mcpClient, err := m.sessionManager.GetOrCreateSession(ctx, server)
 		if err != nil {
 			return nil, err
 		}
 		return &sessionResult{
 			client:         mcpClient,
-			shouldClose:    false, // Don't close stateful sessions after each call
+			shouldClose:    false,
 			serverName:     server.Name,
 			sessionManager: m.sessionManager,
 		}, nil
 	}
 
-	// Default: stateless mode - create a new session for each call
-	mcpClient, err := createMcpServerConnectionWithDB(ctx, m.db, server, m.mcpServerInitReqTimeoutSec, true)
+	// Extract userID from context if a User (not McpClient) is authenticated.
+	var userID *uint
+	if u, ok := ctx.Value("user").(*model.User); ok && u != nil {
+		id := u.ID
+		userID = &id
+	}
+
+	// Stateless mode: create a new session for each call, using the user-scoped token if available.
+	mcpClient, err := createMcpServerConnectionWithDB(ctx, m.db, server, m.mcpServerInitReqTimeoutSec, true, userID)
 	if err != nil {
 		return nil, err
 	}
 	return &sessionResult{
 		client:      mcpClient,
-		shouldClose: true, // Close stateless sessions after each call
+		shouldClose: true,
 	}, nil
 }
 

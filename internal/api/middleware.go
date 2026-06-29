@@ -188,19 +188,28 @@ func (s *Server) checkAuthForMcpProxyAccess() gin.HandlerFunc {
 		authHeader := c.GetHeader("Authorization")
 		token := strings.TrimPrefix(authHeader, "Bearer ")
 		if token == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing MCP client access token"})
-			return
-		}
-		client, err := s.mcpClientService.GetClientByToken(token)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid MCP client token"})
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing access token"})
 			return
 		}
 
-		// inject the authenticated MCP client in context for the proxy to use
-		ctx = context.WithValue(c.Request.Context(), "client", client)
-		c.Request = c.Request.WithContext(ctx)
+		// Try McpClient token first (for AI clients like Claude Desktop, Cursor).
+		mcpClient, err := s.mcpClientService.GetClientByToken(token)
+		if err == nil {
+			ctx = context.WithValue(c.Request.Context(), "client", mcpClient)
+			c.Request = c.Request.WithContext(ctx)
+			c.Next()
+			return
+		}
 
-		c.Next()
+		// Fallback: try User token (for human users with per-user OAuth).
+		authenticatedUser, err := s.userService.GetUserByAccessToken(token)
+		if err == nil {
+			ctx = context.WithValue(c.Request.Context(), "user", authenticatedUser)
+			c.Request = c.Request.WithContext(ctx)
+			c.Next()
+			return
+		}
+
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid access token"})
 	}
 }

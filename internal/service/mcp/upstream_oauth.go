@@ -49,16 +49,24 @@ type upstreamOAuthTokenStore struct {
 	db         *gorm.DB
 	serverName string
 	transport  types.McpServerTransport
+	userID     *uint // nil = gateway-level token store; non-nil = per-user token store
 }
 
-// GetToken loads the currently stored upstream OAuth token for a server.
+// GetToken loads the currently stored upstream OAuth token.
+// When userID is set, it loads the user-scoped token; otherwise the shared gateway token.
 func (s *upstreamOAuthTokenStore) GetToken(ctx context.Context) (*mcpgotransport.Token, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
 	var record model.UpstreamOAuthToken
-	if err := s.db.WithContext(ctx).Where("server_name = ?", s.serverName).First(&record).Error; err != nil {
+	q := s.db.WithContext(ctx)
+	if s.userID != nil {
+		q = q.Where("server_name = ? AND user_id = ?", s.serverName, *s.userID)
+	} else {
+		q = q.Where("server_name = ? AND user_id IS NULL", s.serverName)
+	}
+	if err := q.First(&record).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, mcpgotransport.ErrNoToken
 		}
@@ -87,6 +95,7 @@ func (s *upstreamOAuthTokenStore) SaveToken(ctx context.Context, token *mcpgotra
 
 	record := &model.UpstreamOAuthToken{
 		ServerName:   s.serverName,
+		UserID:       s.userID,
 		Transport:    s.transport,
 		AccessToken:  token.AccessToken,
 		TokenType:    token.TokenType,
@@ -97,7 +106,13 @@ func (s *upstreamOAuthTokenStore) SaveToken(ctx context.Context, token *mcpgotra
 
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var existing model.UpstreamOAuthToken
-		err := tx.Where("server_name = ?", s.serverName).First(&existing).Error
+		q := tx
+		if s.userID != nil {
+			q = q.Where("server_name = ? AND user_id = ?", s.serverName, *s.userID)
+		} else {
+			q = q.Where("server_name = ? AND user_id IS NULL", s.serverName)
+		}
+		err := q.First(&existing).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return tx.Create(record).Error
 		}
@@ -201,7 +216,7 @@ func prepareOAuthConfig(input *types.RegisterServerInput, tokenStore mcpgotransp
 func (m *MCPService) persistOAuthTokenMetadata(ctx context.Context, serverName string, transport types.McpServerTransport, redirectURI, clientID, clientSecret string, scopes []string) error {
 	return m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var record model.UpstreamOAuthToken
-		err := tx.Where("server_name = ?", serverName).First(&record).Error
+		err := tx.Where("server_name = ? AND user_id IS NULL", serverName).First(&record).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			record = model.UpstreamOAuthToken{
 				ServerName:   serverName,
@@ -714,14 +729,307 @@ func (m *MCPService) GetUpstreamOAuthToken(serverName string) (*model.UpstreamOA
 	return getStoredUpstreamOAuthToken(m.db, serverName)
 }
 
-// getStoredUpstreamOAuthToken loads the stored upstream OAuth token record for a server.
+// getStoredUpstreamOAuthToken loads the shared gateway-level OAuth token for a server.
 func getStoredUpstreamOAuthToken(db *gorm.DB, serverName string) (*model.UpstreamOAuthToken, error) {
 	var record model.UpstreamOAuthToken
-	if err := db.Where("server_name = ?", serverName).First(&record).Error; err != nil {
+	if err := db.Where("server_name = ? AND user_id IS NULL", serverName).First(&record).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, fmt.Errorf("upstream OAuth token not found: %w", apierrors.ErrNotFound)
 		}
 		return nil, err
 	}
 	return &record, nil
+}
+
+// getStoredUserUpstreamOAuthToken loads the per-user OAuth token for a server and user.
+func getStoredUserUpstreamOAuthToken(db *gorm.DB, serverName string, userID uint) (*model.UpstreamOAuthToken, error) {
+	var record model.UpstreamOAuthToken
+	if err := db.Where("server_name = ? AND user_id = ?", serverName, userID).First(&record).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("user OAuth token not found: %w", apierrors.ErrNotFound)
+		}
+		return nil, err
+	}
+	return &record, nil
+}
+
+const userUpstreamOAuthPendingSessionTTL = 10 * time.Minute
+
+// UserOAuthStartResult holds the data needed by the caller to redirect the user to the OAuth provider.
+type UserOAuthStartResult struct {
+	SessionID        string
+	AuthorizationURL string
+	ExpiresAt        time.Time
+}
+
+// StartUserUpstreamOAuth initiates a per-user OAuth flow for the given server.
+// The server must already have a gateway-level UpstreamOAuthToken (registered by an admin).
+// The gateway token's client credentials are reused so the user skips DCR.
+func (m *MCPService) StartUserUpstreamOAuth(
+	ctx context.Context,
+	serverName string,
+	userID uint,
+	redirectURIOverride string,
+) (*UserOAuthStartResult, error) {
+	gatewayToken, err := getStoredUpstreamOAuthToken(m.db, serverName)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"server %s has no gateway OAuth token; an admin must register it with OAuth first: %w",
+			serverName, apierrors.ErrNotFound,
+		)
+	}
+
+	redirectURI := gatewayToken.RedirectURI
+	if redirectURIOverride != "" {
+		redirectURI = redirectURIOverride
+	}
+
+	scopes, err := scopesFromJSON(gatewayToken.Scopes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode gateway OAuth scopes: %w", err)
+	}
+
+	server, err := m.GetMcpServer(serverName)
+	if err != nil {
+		return nil, err
+	}
+
+	input := &types.RegisterServerInput{
+		OAuthClientID:     gatewayToken.ClientID,
+		OAuthClientSecret: gatewayToken.ClientSecret,
+		OAuthRedirectURI:  redirectURI,
+		OAuthScopes:       scopes,
+	}
+
+	oauthHandler, err := m.buildOAuthHandlerForRegisteredClient(ctx, server, input)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build OAuth handler for user flow: %w", err)
+	}
+
+	codeVerifier, err := mcpgoclient.GenerateCodeVerifier()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate PKCE code verifier: %w", err)
+	}
+	codeChallenge := mcpgoclient.GenerateCodeChallenge(codeVerifier)
+	state, err := mcpgoclient.GenerateState()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate OAuth state: %w", err)
+	}
+
+	authURL, err := oauthHandler.GetAuthorizationURL(ctx, state, codeChallenge)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get authorization URL: %w", err)
+	}
+
+	sessionID, err := generateOAuthSessionID()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate session ID: %w", err)
+	}
+	expiresAt := time.Now().Add(userUpstreamOAuthPendingSessionTTL)
+
+	if err := m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		tx.Unscoped().Where("server_name = ? AND user_id = ?", serverName, userID).
+			Delete(&model.UserUpstreamOAuthPendingSession{})
+		return tx.Create(&model.UserUpstreamOAuthPendingSession{
+			SessionID:    sessionID,
+			ServerName:   serverName,
+			UserID:       userID,
+			RedirectURI:  redirectURI,
+			ClientID:     gatewayToken.ClientID,
+			ClientSecret: gatewayToken.ClientSecret,
+			Scopes:       gatewayToken.Scopes,
+			State:        state,
+			CodeVerifier: codeVerifier,
+			ExpiresAt:    expiresAt,
+		}).Error
+	}); err != nil {
+		return nil, fmt.Errorf("failed to persist user OAuth pending session: %w", err)
+	}
+
+	return &UserOAuthStartResult{
+		SessionID:        sessionID,
+		AuthorizationURL: authURL,
+		ExpiresAt:        expiresAt,
+	}, nil
+}
+
+// CompleteUserUpstreamOAuthSession exchanges the callback code for a user-scoped token
+// and persists it. The pending session is deleted on success.
+func (m *MCPService) CompleteUserUpstreamOAuthSession(ctx context.Context, sessionID, code, state string) error {
+	if sessionID == "" || code == "" || state == "" {
+		return fmt.Errorf("session_id, code and state are required: %w", apierrors.ErrInvalidInput)
+	}
+
+	var session model.UserUpstreamOAuthPendingSession
+	if err := m.db.WithContext(ctx).Where("session_id = ?", sessionID).First(&session).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("user OAuth session not found: %w", apierrors.ErrNotFound)
+		}
+		return err
+	}
+	if time.Now().After(session.ExpiresAt) {
+		return fmt.Errorf("user OAuth session expired: %w", apierrors.ErrInvalidInput)
+	}
+	if state != session.State {
+		return fmt.Errorf("user OAuth session state mismatch: %w", apierrors.ErrInvalidInput)
+	}
+
+	server, err := m.GetMcpServer(session.ServerName)
+	if err != nil {
+		return err
+	}
+
+	scopes, err := scopesFromJSON(session.Scopes)
+	if err != nil {
+		return fmt.Errorf("failed to decode session scopes: %w", err)
+	}
+
+	input := &types.RegisterServerInput{
+		OAuthClientID:     session.ClientID,
+		OAuthClientSecret: session.ClientSecret,
+		OAuthRedirectURI:  session.RedirectURI,
+		OAuthScopes:       scopes,
+	}
+
+	userID := session.UserID
+	if err := m.persistUserOAuthTokenMetadata(ctx, session.ServerName, server.Transport,
+		session.RedirectURI, session.ClientID, session.ClientSecret, scopes, userID); err != nil {
+		return fmt.Errorf("failed to persist user OAuth token metadata: %w", err)
+	}
+
+	if err := m.processOAuthAuthorizationCodeForUser(ctx, server, input, session.CodeVerifier, state, code, userID); err != nil {
+		return fmt.Errorf("failed to exchange OAuth code for user token: %w", err)
+	}
+
+	return m.db.WithContext(ctx).Unscoped().Delete(&session).Error
+}
+
+// GetUserUpstreamOAuthStatus returns the stored user-scoped OAuth token for a server, if any.
+func (m *MCPService) GetUserUpstreamOAuthStatus(serverName string, userID uint) (*model.UpstreamOAuthToken, error) {
+	return getStoredUserUpstreamOAuthToken(m.db, serverName, userID)
+}
+
+// RevokeUserUpstreamOAuthToken deletes the user-scoped OAuth token for a server.
+func (m *MCPService) RevokeUserUpstreamOAuthToken(ctx context.Context, serverName string, userID uint) error {
+	result := m.db.WithContext(ctx).Unscoped().
+		Where("server_name = ? AND user_id = ?", serverName, userID).
+		Delete(&model.UpstreamOAuthToken{})
+	if result.Error != nil {
+		return fmt.Errorf("failed to revoke user OAuth token: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("no user OAuth token found for server %s: %w", serverName, apierrors.ErrNotFound)
+	}
+	return nil
+}
+
+// GetUserUpstreamOAuthPendingSessionByState loads a pending user OAuth session by OAuth state.
+func (m *MCPService) GetUserUpstreamOAuthPendingSessionByState(ctx context.Context, state string) (*model.UserUpstreamOAuthPendingSession, error) {
+	if state == "" {
+		return nil, fmt.Errorf("state is required: %w", apierrors.ErrInvalidInput)
+	}
+	var session model.UserUpstreamOAuthPendingSession
+	if err := m.db.WithContext(ctx).Where("state = ?", state).First(&session).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("user OAuth session not found: %w", apierrors.ErrNotFound)
+		}
+		return nil, err
+	}
+	return &session, nil
+}
+
+// persistUserOAuthTokenMetadata stores user-scoped OAuth client metadata without clobbering token values.
+func (m *MCPService) persistUserOAuthTokenMetadata(ctx context.Context, serverName string, transport types.McpServerTransport, redirectURI, clientID, clientSecret string, scopes []string, userID uint) error {
+	return m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var record model.UpstreamOAuthToken
+		err := tx.Where("server_name = ? AND user_id = ?", serverName, userID).First(&record).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			record = model.UpstreamOAuthToken{
+				ServerName:   serverName,
+				UserID:       &userID,
+				Transport:    transport,
+				RedirectURI:  redirectURI,
+				ClientID:     clientID,
+				ClientSecret: clientSecret,
+				Scopes:       scopesToJSON(scopes),
+			}
+			return tx.Create(&record).Error
+		}
+		if err != nil {
+			return err
+		}
+		record.Transport = transport
+		record.RedirectURI = redirectURI
+		record.ClientID = clientID
+		record.ClientSecret = clientSecret
+		record.Scopes = scopesToJSON(scopes)
+		return tx.Save(&record).Error
+	})
+}
+
+// processOAuthAuthorizationCodeForUser exchanges an authorization code for a user-scoped token.
+func (m *MCPService) processOAuthAuthorizationCodeForUser(ctx context.Context, server *model.McpServer, input *types.RegisterServerInput, codeVerifier, state, code string, userID uint) error {
+	tokenStore := &upstreamOAuthTokenStore{
+		db:         m.db,
+		serverName: server.Name,
+		transport:  server.Transport,
+		userID:     &userID,
+	}
+
+	var oauthErr *mcpgoclient.OAuthAuthorizationRequiredError
+
+	switch server.Transport {
+	case types.TransportStreamableHTTP:
+		conf, err := server.GetStreamableHTTPConfig()
+		if err != nil {
+			return err
+		}
+		opts := prepareSHTTPClientOptions(server.Name, conf)
+		c, err := mcpgoclient.NewOAuthStreamableHttpClient(conf.URL, prepareOAuthConfig(input, tokenStore), opts...)
+		if err != nil {
+			return fmt.Errorf("failed to create OAuth HTTP client for user token exchange: %w", err)
+		}
+		defer c.Close()
+		_, err = c.Initialize(ctx, defaultHTTPInitializeRequest(conf.URL))
+		if !errors.As(err, &oauthErr) {
+			if err == nil {
+				return fmt.Errorf("unexpectedly initialized upstream server before user OAuth token exchange")
+			}
+			return fmt.Errorf("failed to prepare OAuth HTTP handler for user: %w", err)
+		}
+	case types.TransportSSE:
+		conf, err := server.GetSSEConfig()
+		if err != nil {
+			return err
+		}
+		c, err := mcpgoclient.NewOAuthSSEClient(conf.URL, prepareOAuthConfig(input, tokenStore))
+		if err != nil {
+			return fmt.Errorf("failed to create OAuth SSE client for user token exchange: %w", err)
+		}
+		defer c.Close()
+		err = c.Start(ctx)
+		if !errors.As(err, &oauthErr) {
+			if err == nil {
+				_, err = c.Initialize(ctx, defaultSSEInitializeRequest())
+			}
+			if !errors.As(err, &oauthErr) {
+				if err == nil {
+					return fmt.Errorf("unexpectedly initialized upstream server before user OAuth token exchange")
+				}
+				return fmt.Errorf("failed to prepare OAuth SSE handler for user: %w", err)
+			}
+		}
+	default:
+		return fmt.Errorf("OAuth user flow is only supported for HTTP and SSE MCP servers: %w", apierrors.ErrInvalidInput)
+	}
+
+	if oauthErr == nil || oauthErr.Handler == nil {
+		return fmt.Errorf("failed to retrieve OAuth handler for user token exchange")
+	}
+
+	oauthErr.Handler.SetExpectedState(state)
+	if err := oauthErr.Handler.ProcessAuthorizationResponse(ctx, code, state, codeVerifier); err != nil {
+		return fmt.Errorf("failed to exchange OAuth authorization code for user token: %w", err)
+	}
+	return nil
 }

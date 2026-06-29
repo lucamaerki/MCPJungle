@@ -195,6 +195,9 @@ func (s *Server) setupRouter() (*gin.Engine, error) {
 
 	r.POST("/init", s.registerInitServerHandler())
 
+	// Public OAuth callback for per-user upstream OAuth flows.
+	r.GET("/oauth/user-callback", s.requireInitialized(), s.userOAuthCallbackHandler())
+
 	requireEnterpriseMode := s.requireServerMode(model.ModeEnterprise)
 	requireDashboardMode := s.requireDashboardMode()
 
@@ -278,6 +281,12 @@ func (s *Server) setupRouter() (*gin.Engine, error) {
 		userAPI.POST("/prompts/render", s.getPromptWithArgsHandler())
 
 		userAPI.GET("/users/whoami", requireEnterpriseMode, s.whoAmIHandler())
+
+		// Per-user upstream OAuth endpoints (enterprise mode only).
+		userAPI.POST("/servers/:name/user-oauth/start", requireEnterpriseMode, s.startUserOAuthHandler())
+		userAPI.GET("/servers/:name/user-oauth/status", requireEnterpriseMode, s.getUserOAuthStatusHandler())
+		userAPI.DELETE("/servers/:name/user-oauth", requireEnterpriseMode, s.revokeUserOAuthHandler())
+		userAPI.POST("/user-oauth/sessions/:id/complete", requireEnterpriseMode, s.completeUserOAuthSessionHandler())
 	}
 
 	// endpoints only accessible by an admin user in enterprise mode or anyone in development mode

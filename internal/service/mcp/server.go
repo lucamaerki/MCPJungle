@@ -98,6 +98,7 @@ func (m *MCPService) registerMcpServer(ctx context.Context, s *model.McpServer, 
 		s,
 		m.mcpServerInitReqTimeoutSec,
 		useStoredUpstreamAuth,
+		nil,
 	)
 	if err != nil {
 		return err
@@ -167,6 +168,9 @@ func (m *MCPService) DeregisterMcpServer(name string) error {
 	}
 	if err := m.db.Unscoped().Where("server_name = ?", name).Delete(&model.UpstreamOAuthPendingSession{}).Error; err != nil {
 		return fmt.Errorf("failed to remove pending upstream OAuth sessions for server %s: %w", name, err)
+	}
+	if err := m.db.Unscoped().Where("server_name = ?", name).Delete(&model.UserUpstreamOAuthPendingSession{}).Error; err != nil {
+		return fmt.Errorf("failed to remove pending user OAuth sessions for server %s: %w", name, err)
 	}
 
 	// Close any stateful session associated with this server
