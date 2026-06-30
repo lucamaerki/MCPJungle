@@ -4,12 +4,12 @@ services:
     container_name: mcpjungle-db
     environment:
       POSTGRES_USER: mcpjungle
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_PASSWORD: mcpjungle_db_pass
       POSTGRES_DB: mcpjungle
     volumes:
       - db_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "PGPASSWORD=${DB_PASSWORD} pg_isready -U mcpjungle"]
+      test: ["CMD-SHELL", "pg_isready -U mcpjungle"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -19,7 +19,7 @@ services:
     image: ghcr.io/lucamaerki/mcpjungle:latest
     container_name: mcpjungle-server
     environment:
-      DATABASE_URL: postgres://mcpjungle:${DB_PASSWORD}@db:5432/mcpjungle
+      DATABASE_URL: postgres://mcpjungle:mcpjungle_db_pass@db:5432/mcpjungle
       SERVER_MODE: enterprise
     ports:
       - "8080:8080"
