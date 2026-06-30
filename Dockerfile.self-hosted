@@ -10,7 +10,7 @@ COPY . .
 RUN mkdir -p internal/dashboardui/dist && \
     echo '<!DOCTYPE html><html><body>MCPJungle</body></html>' > internal/dashboardui/dist/index.html
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o mcpjungle ./cmd/mcpjungle
+RUN CGO_ENABLED=0 GOOS=linux go build -o mcpjungle .
 
 FROM gcr.io/distroless/static-debian12
 
