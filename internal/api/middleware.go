@@ -39,7 +39,7 @@ func (s *Server) requireDashboardMode() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "invalid server mode in context"})
 			return
 		}
-		if currentMode != model.ModeDev {
+		if currentMode != model.ModeDev && currentMode != model.ModeEnterprise {
 			c.AbortWithStatus(http.StatusNotFound)
 			return
 		}
