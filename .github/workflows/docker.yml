@@ -6,7 +6,6 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build-and-push:
@@ -19,6 +18,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Create frontend placeholder
+        run: |
+          mkdir -p internal/dashboardui/dist
+          echo '<!DOCTYPE html><html><body>MCPJungle</body></html>' > internal/dashboardui/dist/index.html
+
+      - name: Build binary
+        run: CGO_ENABLED=0 GOOS=linux go build -o mcpjungle ./cmd/mcpjungle
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -26,10 +38,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: Dockerfile.self-hosted
+          file: Dockerfile
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/mcpjungle:latest
